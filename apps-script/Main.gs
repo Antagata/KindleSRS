@@ -35,8 +35,12 @@ const SEND_TO_EMAIL = ''; // e.g., 'you@example.com'
 const MAX_FUTURE_PDFS_PER_RUN = 6; // tweak if runs are fast/slow on your account
 
 // Concept images + dictionary/IPA
-const DICT_ENDPOINT = (w) => `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(w)}`;
-const WIKI_SUMMARY  = (w) => `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(w)}`;
+function DICT_ENDPOINT(w) {
+  return 'https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(w);
+}
+function WIKI_SUMMARY(w) {
+  return 'https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(w);
+}
 const CONCEPT_IMG_MAX_WIDTH = 300;
 
 // Audio
@@ -271,8 +275,8 @@ function generatePdfForDay_(localMidnight, wordKeys, state, reviewsFolder) {
 }
 
 function driveDirectLink_(fileId, mode) {
-  const exportParam = mode === 'download' ? 'download' : 'view';
-  return `https://drive.google.com/uc?export=${exportParam}&id=${fileId}`;
+  var exportParam = (mode === 'download') ? 'download' : 'view';
+  return 'https://drive.google.com/uc?export=' + exportParam + '&id=' + fileId;
 }
 
 /** ---------- CALENDAR ---------- **/
@@ -667,8 +671,8 @@ function _logScheduleNote_() {
 
   Logger.log(
     `[Scheduler] Now: ` +
-    `${Utilities.formatDate(now, tz, "EEE, yyyy-MM-dd HH:mm:ss '('Z')'")}  | ` +
-    `Next planned 17:00: ${Utilities.formatDate(next, tz, "EEE, yyyy-MM-dd HH:mm '('"+tz+"')'")}  | ` +
+    `${Utilities.formatDate(now, tz, "EEE, yyyy-MM-dd HH:mm:ss")} (${tz})  | ` +
+    `Next planned 17:00: ${Utilities.formatDate(next, tz, "EEE, yyyy-MM-dd HH:mm")} (${tz})  | ` +
     `Time-driven trigger for runDaily present: ${hasDailyTrigger ? 'YES' : 'NO'}`
   );
 }
@@ -771,6 +775,18 @@ function forceRegenerateToday() {
 /** ---- Temporary: inspect existing triggers ---- */
 function showTriggers() {
   ScriptApp.getProjectTriggers().forEach(t => {
-    Logger.log(`handler=${t.getHandlerFunction?.()} type=${t.getEventType?.()}`);
+    const hf = typeof t.getHandlerFunction === 'function' ? t.getHandlerFunction() : '';
+    const et = typeof t.getEventType === 'function' ? t.getEventType() : '';
+    Logger.log(`handler=${hf} type=${et}`);
   });
+}
+
+/** ---- Bootstrap authentication - run once to trigger consent screen ---- */
+function __bootstrapAuth() {
+  // Touch Docs
+  const d = DocumentApp.create("KindleSRS Auth Bootstrap " + new Date());
+  // Touch Drive (create & trash a folder to assert Drive scope)
+  const f = DriveApp.createFolder("KindleSRS_AUTH_TEST");
+  f.setTrashed(true);
+  DriveApp.getFileById(d.getId()).setTrashed(true);
 }
