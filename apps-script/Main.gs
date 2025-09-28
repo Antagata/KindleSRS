@@ -669,10 +669,12 @@ function _logScheduleNote_() {
     );
   } catch (e) { /* ignore */ }
 
+  const nowFormatted = Utilities.formatDate(now, tz, "EEE, yyyy-MM-dd HH:mm:ss");
+  const nextFormatted = Utilities.formatDate(next, tz, "EEE, yyyy-MM-dd HH:mm");
+  
   Logger.log(
-    `[Scheduler] Now: ` +
-    `${Utilities.formatDate(now, tz, "EEE, yyyy-MM-dd HH:mm:ss")} (${tz})  | ` +
-    `Next planned 17:00: ${Utilities.formatDate(next, tz, "EEE, yyyy-MM-dd HH:mm")} (${tz})  | ` +
+    `[Scheduler] Now: ${nowFormatted} (${tz})  | ` +
+    `Next planned 17:00: ${nextFormatted} (${tz})  | ` +
     `Time-driven trigger for runDaily present: ${hasDailyTrigger ? 'YES' : 'NO'}`
   );
 }
