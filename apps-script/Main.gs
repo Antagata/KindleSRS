@@ -153,6 +153,15 @@ function _runForDate_(jsDate) {
     } catch (e) { /* ignore */ }
   }
 
+  // CRITICAL: Remove today's date from due_dates after review is completed
+  dueKeys.forEach(key => {
+    const word = state.words[key];
+    if (word && word.due_dates) {
+      const dueDates = word.due_dates.filter(date => date !== todayISO);
+      word.due_dates = dueDates;
+    }
+  });
+
   writeJson_(stateFile, state);
   writeJson_(defCacheFile, defCache);
   Logger.log(`Done ${todayISO}: ${dueKeys.length} words • new words merged: ${newWords}`);
