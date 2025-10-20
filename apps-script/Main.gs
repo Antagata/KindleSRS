@@ -96,7 +96,7 @@ function _runForDate_(jsDate) {
     if (!state.words[key]) {
       state.words[key] = {
         word: rec.word,
-        definition: rec.stem || '',
+        definition: '[pending]',  // Definition will be fetched by hydration
         context: rec.context || '',
         source: rec.source || '',
         first_seen: null,
@@ -109,9 +109,8 @@ function _runForDate_(jsDate) {
         audio_sentence_url: ''
       };
       newWords++;
-    } else if (!state.words[key].definition && rec.stem) {
-      state.words[key].definition = rec.stem;
     }
+    // Note: we no longer overwrite with stem - let hydration fetch real definitions
   });
 
   // Ensure min words (robust: seed -> borrow -> restart)
@@ -120,6 +119,7 @@ function _runForDate_(jsDate) {
   // Due today
   const todayISO = toISODate_(local, tz);
   let dueKeys = Object.keys(state.words).filter(k => (state.words[k].due_dates || []).indexOf(todayISO) !== -1);
+  
   if (MAX_WORDS_PER_DAY > 0 && dueKeys.length > MAX_WORDS_PER_DAY) {
     dueKeys = dueKeys.slice(0, MAX_WORDS_PER_DAY);
   }
@@ -157,7 +157,29 @@ function _runForDate_(jsDate) {
   dueKeys.forEach(key => {
     const word = state.words[key];
     if (word && word.due_dates) {
-      const dueDates = word.due_dates.filter(date => date !== todayISO);
+      const beforeDates = word.due_dates.slice();
+      let dueDates = word.due_dates.filter(date => date !== todayISO);
+      
+      // CLEANUP: Detect corrupted schedules and reset to proper SRS
+      const totalDates = dueDates.length;
+      const futureDates = dueDates.filter(date => date > todayISO);
+      const recentDates = dueDates.filter(date => date >= '2025-10-01').length; // Recent excessive scheduling
+      
+      const needsCleanup = (
+        futureDates.length > 5 ||        // Too many future dates
+        totalDates > 15 ||               // Too many total dates  
+        recentDates > 10                 // Too many recent dates (indicates over-scheduling)
+      );
+      
+      if (needsCleanup) {
+        // Keep only past dates (for history) and schedule next proper SRS review
+        const pastDates = dueDates.filter(date => date < todayISO);
+        const nextReviewDate = addDays_(local, SRS_OFFSETS[0]); // Next review in 1 day
+        const nextReviewISO = toISODate_(nextReviewDate, tz);
+        
+        dueDates = [...pastDates, nextReviewISO];
+      }
+      
       word.due_dates = dueDates;
     }
   });
@@ -429,10 +451,15 @@ function _hydrateDefinitions_(keys, state, defCache) {
 
     const lc = (w.word || '').toLowerCase();
 
-    let needDef = !(w.definition && w.definition.trim());
+    // Check if definition needs fetching (empty, '[pending]', or equals the word itself)
+    let needDef = !w.definition ||
+                  w.definition.trim() === '' ||
+                  w.definition === '[pending]' ||
+                  w.definition.toLowerCase() === lc;  // Avoid self-referential definitions
     let needIPA = !(w.pron_ipa && w.pron_ipa.trim());
     let needDictAudio = !(w.audio_word_url && w.audio_word_url.trim());
 
+    // Try cache first
     if (needDef && defCache.defs[lc]) { w.definition = defCache.defs[lc]; needDef = false; }
     if (needIPA && defCache.ipa[lc])   { w.pron_ipa   = defCache.ipa[lc];  needIPA = false; }
     if (needDictAudio && defCache.dictAudio[lc]) {
@@ -440,35 +467,70 @@ function _hydrateDefinitions_(keys, state, defCache) {
     }
     if (!needDef && !needIPA && !needDictAudio) return;
 
+    // Try Dictionary API first
     try {
       const resp = UrlFetchApp.fetch(DICT_ENDPOINT(w.word), { muteHttpExceptions: true });
-      if (resp.getResponseCode() !== 200) return;
-      const data = JSON.parse(resp.getContentText());
-      if (Array.isArray(data) && data.length) {
-        if (needDef && data[0].meanings?.length) {
-          const defs = data[0].meanings[0].definitions || [];
-          if (defs.length && defs[0].definition) {
-            w.definition = String(defs[0].definition).trim();
-            defCache.defs[lc] = w.definition; needDef = false;
+      if (resp.getResponseCode() === 200) {
+        const data = JSON.parse(resp.getContentText());
+        if (Array.isArray(data) && data.length) {
+          // Fetch definition
+          if (needDef && data[0].meanings?.length) {
+            const defs = data[0].meanings[0].definitions || [];
+            if (defs.length && defs[0].definition) {
+              w.definition = String(defs[0].definition).trim();
+              defCache.defs[lc] = w.definition;
+              needDef = false;
+            }
           }
-        }
-        const ph = data[0].phonetics || [];
-        if (ph.length) {
-          if (needIPA) {
-            const ipa = (ph.find(p => p.text)?.text) || '';
-            if (ipa) { w.pron_ipa = ipa; defCache.ipa[lc] = ipa; needIPA = false; }
-          }
-          if (needDictAudio) {
-            const audioUrl = (ph.find(p => p.audio)?.audio) || '';
-            if (audioUrl) {
-              w.audio_word_url = audioUrl;
-              defCache.dictAudio[lc] = w.audio_word_url;
-              needDictAudio = false;
+          // Fetch IPA and audio
+          const ph = data[0].phonetics || [];
+          if (ph.length) {
+            if (needIPA) {
+              const ipa = (ph.find(p => p.text)?.text) || '';
+              if (ipa) { w.pron_ipa = ipa; defCache.ipa[lc] = ipa; needIPA = false; }
+            }
+            if (needDictAudio) {
+              const audioUrl = (ph.find(p => p.audio)?.audio) || '';
+              if (audioUrl) {
+                w.audio_word_url = audioUrl;
+                defCache.dictAudio[lc] = w.audio_word_url;
+                needDictAudio = false;
+              }
             }
           }
         }
       }
     } catch (e) { /* ignore */ }
+
+    // Wikipedia fallback for definition if dictionary API failed
+    if (needDef) {
+      try {
+        const wikiResp = UrlFetchApp.fetch(WIKI_SUMMARY(w.word), { muteHttpExceptions: true });
+        if (wikiResp.getResponseCode() === 200) {
+          const wikiData = JSON.parse(wikiResp.getContentText());
+          if (wikiData && wikiData.extract) {
+            // Use first sentence or first ~150 chars as definition
+            let extract = String(wikiData.extract).trim();
+            const firstSentence = extract.split(/[.!?]\s/)[0];
+            if (firstSentence && firstSentence.length > 20) {
+              w.definition = firstSentence + '.';
+              defCache.defs[lc] = w.definition;
+              needDef = false;
+            } else if (extract.length > 20) {
+              // Use truncated extract if first sentence is too short
+              w.definition = extract.substring(0, 150) + (extract.length > 150 ? '...' : '');
+              defCache.defs[lc] = w.definition;
+              needDef = false;
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    // If still no definition, mark as "No definition found"
+    if (needDef && (!w.definition || w.definition === '[pending]')) {
+      w.definition = 'No definition found';
+    }
   });
 }
 
@@ -781,6 +843,276 @@ function forceRegenerateToday() {
 
   writeJson_(stateFile, state);
   runOnce();
+}
+
+/** ---- 15-DAY SRS SCHEDULE ANALYSIS ---- */
+function analyze15DaySchedule() {
+  const tz = TIMEZONE;
+  const root = ensureFolderPath_(ROOT_PATH);
+  const state = readJson_(ensureStateFile_(root, STATE_FILENAME)) || {words:{}, daily:{}};
+  const today = toLocalDate(new Date(), tz);
+  
+  Logger.log('=== 15-DAY SRS SCHEDULE ANALYSIS ===');
+  Logger.log('');
+  
+  let totalReviews = 0;
+  const dailyWordCounts = [];
+  const allScheduledWords = new Set();
+  const wordFrequency = {};
+  
+  // Analyze each day
+  for (let i = 0; i < 15; i++) {
+    const date = addDays_(today, i);
+    const dateISO = toISODate_(date, tz);
+    const wordKeysForDay = Object.keys(state.words).filter(k => 
+      (state.words[k].due_dates || []).indexOf(dateISO) !== -1
+    );
+    
+    const dayName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][date.getDay()];
+    const dayLabel = i === 0 ? 'TODAY' : i === 1 ? 'TOMORROW' : `Day +${i}`;
+    
+    Logger.log(`${dayLabel.padEnd(10)} ${dayName} ${dateISO}: ${wordKeysForDay.length} word(s)`);
+    
+    // Track word frequency and details
+    wordKeysForDay.forEach(key => {
+      const word = state.words[key];
+      allScheduledWords.add(word.word);
+      wordFrequency[word.word] = (wordFrequency[word.word] || 0) + 1;
+      
+      if (wordKeysForDay.length <= 10) { // Only show details if not too many
+        const definition = word.definition || 'No definition';
+        const source = word.source || 'Unknown source';
+        Logger.log(`    • "${word.word}" - ${definition} [${source}]`);
+      }
+    });
+    
+    dailyWordCounts.push(wordKeysForDay.length);
+    totalReviews += wordKeysForDay.length;
+    Logger.log('');
+  }
+  
+  // Analysis Summary
+  Logger.log('=== SRS CADENCE ANALYSIS ===');
+  Logger.log(`📊 Total reviews: ${totalReviews} over 15 days`);
+  Logger.log(`📈 Average per day: ${(totalReviews/15).toFixed(1)} reviews`);
+  Logger.log(`📉 Min/Max per day: ${Math.min(...dailyWordCounts)} / ${Math.max(...dailyWordCounts)}`);
+  Logger.log(`🎯 Unique words: ${allScheduledWords.size} different words`);
+  Logger.log('');
+  
+  // Check for issues
+  const duplicateWords = Object.entries(wordFrequency).filter(([word, count]) => count > 5);
+  const veryLightDays = dailyWordCounts.filter(count => count < 2).length;
+  const veryHeavyDays = dailyWordCounts.filter(count => count > 20).length;
+  
+  Logger.log('=== HEALTH CHECK ===');
+  if (duplicateWords.length > 0) {
+    Logger.log(`⚠️  Words appearing too frequently (>5 times):`);
+    duplicateWords.forEach(([word, count]) => {
+      Logger.log(`   "${word}" appears ${count} times`);
+    });
+  }
+  
+  if (veryLightDays > 0) Logger.log(`📉 ${veryLightDays} days have very few reviews (<2)`);
+  if (veryHeavyDays > 0) Logger.log(`📈 ${veryHeavyDays} days have many reviews (>20)`);
+  
+  if (duplicateWords.length === 0 && veryLightDays <= 2 && veryHeavyDays <= 2) {
+    Logger.log('✅ SRS schedule looks healthy!');
+  }
+  
+  Logger.log('');
+  Logger.log('💡 Use markWordAsMastered(["word1", "word2"]) to remove mastered words');
+}
+
+/** ---- Quick function to master the word "put" ---- */
+function masterWordPut() {
+  markWordAsMastered(["put"]);
+}
+
+/** ---- Quick function to master all problematic words ---- */
+function masterProblematicWords() {
+  markWordAsMastered(["put", "bade", "antics", "prodded", "gauze"]);
+}
+
+/** ---- Master duplicate words ---- */
+function masterDuplicateWords() {
+  markWordAsMastered(["British", "incredibly"]);
+}
+
+/** ---- Spread out clustered schedule for better daily distribution ---- */
+function fixScheduleClustering() {
+  const tz = TIMEZONE;
+  const root = ensureFolderPath_(ROOT_PATH);
+  const stateFile = ensureStateFile_(root, STATE_FILENAME);
+  const state = readJson_(stateFile) || {words:{}, daily:{}};
+  const today = toLocalDate(new Date(), tz);
+  const todayISO = toISODate_(today, tz);
+  
+  Logger.log('=== FIXING SCHEDULE CLUSTERING ===');
+  Logger.log('');
+  
+  // Find words with future dates
+  const activeWords = [];
+  Object.keys(state.words).forEach(key => {
+    const word = state.words[key];
+    const futureDates = (word.due_dates || []).filter(date => date > todayISO);
+    if (futureDates.length > 0) {
+      activeWords.push({
+        key: key,
+        word: word.word,
+        futureDates: futureDates
+      });
+    }
+  });
+  
+  Logger.log(`📊 Found ${activeWords.length} active words to redistribute`);
+  
+  // Redistribute words across 15 days more evenly
+  activeWords.forEach((item, index) => {
+    const word = state.words[item.key];
+    const pastDates = (word.due_dates || []).filter(date => date <= todayISO);
+    
+    // Create staggered schedule: spread words across different starting days
+    const startOffset = (index % 7) + 1; // Start between day 1-7
+    const newDates = [];
+    
+    // Each word gets reviews at: start, start+3, start+7, start+14, start+30
+    [0, 3, 7, 14, 30].forEach(interval => {
+      const reviewDate = addDays_(today, startOffset + interval);
+      const reviewISO = toISODate_(reviewDate, tz);
+      newDates.push(reviewISO);
+    });
+    
+    // Keep past dates + new distributed future dates
+    word.due_dates = [...pastDates, ...newDates].sort();
+    
+    if (index < 10) { // Show first 10 as examples
+      Logger.log(`✅ "${word.word}": new schedule starts day +${startOffset}`);
+    }
+  });
+  
+  writeJson_(stateFile, state);
+  
+  Logger.log('');
+  Logger.log(`🎉 Redistributed ${activeWords.length} words across 15 days`);
+  Logger.log('📅 Words now start on different days for better distribution');
+  Logger.log('🔄 Run analyze15DaySchedule() to see improved balance');
+}
+
+/*
+ * =============================================================================
+ * 📍 USER MANAGEMENT FUNCTIONS - ADD YOUR CUSTOM FUNCTIONS HERE
+ * =============================================================================
+ * These functions should be placed at the end of your script, after all the 
+ * core SRS functionality but before the final utility functions.
+ * 
+ * Current location: After line ~830, before showTriggers() function
+ * =============================================================================
+ */
+
+/** ---- Mark words as mastered (removes from SRS and replaces with new words) ---- */
+function markWordAsMastered(wordsToMaster) {
+  if (!Array.isArray(wordsToMaster) || wordsToMaster.length === 0) {
+    Logger.log('❌ ERROR: Please provide an array of words to mark as mastered');
+    Logger.log('📝 EXAMPLE: markWordAsMastered(["the", "incredibly"])');
+    return;
+  }
+  
+  const tz = TIMEZONE;
+  const root = ensureFolderPath_(ROOT_PATH);
+  const stateFile = ensureStateFile_(root, STATE_FILENAME);
+  const state = readJson_(stateFile) || {words:{}, daily:{}};
+  const today = toLocalDate(new Date(), tz);
+  
+  Logger.log('=== MARKING WORDS AS MASTERED ===');
+  Logger.log('');
+  
+  let masteredCount = 0;
+  let notFoundCount = 0;
+  
+  wordsToMaster.forEach(wordToMaster => {
+    // Find the word key (word + source combination)
+    const matchingKeys = Object.keys(state.words).filter(key => 
+      state.words[key].word === wordToMaster
+    );
+    
+    if (matchingKeys.length === 0) {
+      Logger.log(`❌ Word "${wordToMaster}" not found in system`);
+      notFoundCount++;
+    } else {
+      matchingKeys.forEach(key => {
+        const word = state.words[key];
+        Logger.log(`✅ Mastered "${wordToMaster}" from ${word.source || 'unknown source'}`);
+        Logger.log(`   Definition: ${word.definition || 'No definition'}`);
+        
+        // Mark as mastered instead of deleting - keeps history
+        word.mastered = true;
+        word.mastered_date = toISODate_(today, tz);
+        word.due_dates = []; // Remove from future reviews
+        
+        masteredCount++;
+      });
+    }
+  });
+  
+  if (masteredCount > 0) {
+    // Replace mastered words with new ones from completed pool
+    Logger.log('');
+    Logger.log('� REPLACING WITH NEW WORDS...');
+    
+    // Find completed words to restart
+    const completedWords = [];
+    Object.keys(state.words).forEach(key => {
+      const word = state.words[key];
+      const dueDates = word.due_dates || [];
+      const futureDates = dueDates.filter(date => date > toISODate_(today, tz));
+      const hasPastDates = dueDates.some(date => date < toISODate_(today, tz));
+      
+      // Not mastered and completed cycle = candidate for restart
+      if (!word.mastered && word.first_seen && hasPastDates && futureDates.length === 0) {
+        completedWords.push({
+          key: key,
+          word: word.word,
+          lastDate: Math.max(...dueDates.map(d => new Date(d)))
+        });
+      }
+    });
+    
+    // Sort by last review date and restart the same number as mastered
+    completedWords.sort((a, b) => a.lastDate - b.lastDate);
+    const toRestart = completedWords.slice(0, masteredCount);
+    
+    toRestart.forEach(item => {
+      const word = state.words[item.key];
+      
+      // Add new SRS cycle starting from tomorrow
+      const newDates = [];
+      SRS_OFFSETS.forEach(offset => {
+        const reviewDate = addDays_(today, offset);
+        const reviewISO = toISODate_(reviewDate, tz);
+        newDates.push(reviewISO);
+      });
+      
+      const existingDates = word.due_dates || [];
+      const combinedDates = [...existingDates, ...newDates];
+      word.due_dates = Array.from(new Set(combinedDates)).sort();
+      
+      Logger.log(`🆕 Replaced with "${word.word}" - next reviews: ${newDates.join(', ')}`);
+    });
+    
+    writeJson_(stateFile, state);
+    
+    Logger.log('');
+    Logger.log(`✅ Successfully mastered ${masteredCount} word(s)`);
+    Logger.log(`� Replaced with ${toRestart.length} new words`);
+    if (notFoundCount > 0) {
+      Logger.log(`⚠️  ${notFoundCount} word(s) not found`);
+    }
+    Logger.log('💾 State file updated');
+    Logger.log('');
+    Logger.log('🔄 Run analyze15DaySchedule() to see updated schedule');
+  } else {
+    Logger.log('❌ No words were mastered');
+  }
 }
 
 /** ---- Temporary: inspect existing triggers ---- */
