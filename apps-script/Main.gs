@@ -1,8 +1,8 @@
 /*******************************
- * Kindle SRS — Apps Script (Drive + Calendar, daily at 17:00)
- * - Today: full hydration (defs/IPA/audio/image) + PDF + Calendar
+ * Kindle SRS — Apps Script (Drive + Notion, daily at 17:00)
+ * - Today: full hydration (defs/IPA/audio/image) + PDF + Notion
  * - Future: safe planning (seed-only, horizon-capped) + PDFs generated in small batches
- * - Calendar links point to a direct PDF preview (uc?export=view&id=...)
+ * - Notion integration sends daily words to your Notion database
  *******************************/
 
 /** ---------- CONFIG ---------- **/
@@ -16,8 +16,6 @@ const DEF_CACHE_FILENAME = 'definitions_cache.json';
 const TIMEZONE = 'Europe/Zurich';
 const REVIEW_HOUR = 17;
 const REVIEW_MIN = 0;
-const EVENT_DURATION_MIN = 15;
-const CALENDAR_ID = 'primary';
 
 const SRS_OFFSETS = [1, 3, 7, 14, 30];
 const MIN_WORDS_PER_DAY = 1;
@@ -25,11 +23,15 @@ const PLAN_HORIZON_DAYS = 60;      // plan up to 60 days ahead
 const PREFILL_FROM_TOMORROW = true;
 
 const MAX_WORDS_PER_DAY = 0;       // 0 = no cap for daily PDF
-const ADD_CAL_EMAIL_REMINDER = true;
-const ADD_CAL_POPUP_REMINDER  = true;
 
-const SEND_EMAIL = false;
-const SEND_TO_EMAIL = ''; // e.g., 'you@example.com'
+// Email notification settings
+const SEND_EMAIL = true;
+const SEND_TO_EMAIL = 'afrimath111@gmail.com';
+
+// Notion integration settings
+const SEND_TO_NOTION = true;
+const NOTION_API_KEY = 'YOUR_NOTION_API_KEY'; // You'll add this after setting up Notion API
+const NOTION_DATABASE_ID = '2ada999f2ee8803ba54beef705cdd4c6'; // Extracted from your Notion URL
 
 // Future PDFs: generate a limited number per run to avoid timeouts
 const MAX_FUTURE_PDFS_PER_RUN = 6; // tweak if runs are fast/slow on your account
@@ -132,7 +134,7 @@ function _runForDate_(jsDate) {
   _downloadDictAudiosToDrive_(dueKeys, state, defCache, audioFolderRef);
   _ensureSentenceAudio_(dueKeys, state, audioFolderRef);
 
-  // PDF + Calendar (direct preview link)
+  // PDF generation
   const daily = (state.daily[todayISO] = state.daily[todayISO] || {});
   daily.word_keys = dueKeys;
 
@@ -141,8 +143,12 @@ function _runForDate_(jsDate) {
   daily.pdf_link    = pdfLink;
   daily.pdf_direct  = pdfDirect;
 
-  createOrReplaceEvent_(local, dueKeys.length, pdfDirect);
+  // Send to Notion
+  if (SEND_TO_NOTION) {
+    _sendToNotion_(dueKeys, state, todayISO, pdfDirect);
+  }
 
+  // Send email notification
   if (SEND_EMAIL) {
     try {
       MailApp.sendEmail({
@@ -154,32 +160,31 @@ function _runForDate_(jsDate) {
   }
 
   // CRITICAL: Remove today's date from due_dates after review is completed
+  // Then schedule the NEXT review based on SRS progression
   dueKeys.forEach(key => {
     const word = state.words[key];
     if (word && word.due_dates) {
-      const beforeDates = word.due_dates.slice();
+      // Remove today from the schedule
       let dueDates = word.due_dates.filter(date => date !== todayISO);
-      
-      // CLEANUP: Detect corrupted schedules and reset to proper SRS
-      const totalDates = dueDates.length;
-      const futureDates = dueDates.filter(date => date > todayISO);
-      const recentDates = dueDates.filter(date => date >= '2025-10-01').length; // Recent excessive scheduling
-      
-      const needsCleanup = (
-        futureDates.length > 5 ||        // Too many future dates
-        totalDates > 15 ||               // Too many total dates  
-        recentDates > 10                 // Too many recent dates (indicates over-scheduling)
-      );
-      
-      if (needsCleanup) {
-        // Keep only past dates (for history) and schedule next proper SRS review
-        const pastDates = dueDates.filter(date => date < todayISO);
-        const nextReviewDate = addDays_(local, SRS_OFFSETS[0]); // Next review in 1 day
-        const nextReviewISO = toISODate_(nextReviewDate, tz);
-        
-        dueDates = [...pastDates, nextReviewISO];
+
+      // Count how many times this word has been reviewed (past dates only)
+      const pastReviews = dueDates.filter(date => date < todayISO).length + 1; // +1 for today
+
+      // Determine next SRS interval based on review count
+      // Review 1 → next in 1 day, Review 2 → next in 3 days, etc.
+      const nextIntervalIndex = Math.min(pastReviews, SRS_OFFSETS.length - 1);
+      const nextInterval = SRS_OFFSETS[nextIntervalIndex];
+
+      // Schedule next review
+      const nextReviewDate = addDays_(local, nextInterval);
+      const nextReviewISO = toISODate_(nextReviewDate, tz);
+
+      // Add next review date if not already scheduled
+      if (dueDates.indexOf(nextReviewISO) === -1) {
+        dueDates.push(nextReviewISO);
+        dueDates.sort();
       }
-      
+
       word.due_dates = dueDates;
     }
   });
@@ -232,7 +237,6 @@ function _generateFutureBatch_(startJsDate) {
     state.daily[ymd].pdf_link    = pdfLink;
     state.daily[ymd].pdf_direct  = pdfDirect;
 
-    createOrReplaceEvent_(day, keys.length, pdfDirect);
     created++;
   }
 
@@ -310,7 +314,10 @@ function driveDirectLink_(fileId, mode) {
   return 'https://drive.google.com/uc?export=' + exportParam + '&id=' + fileId;
 }
 
-/** ---------- CALENDAR ---------- **/
+/** ---------- CALENDAR (DEPRECATED - Using Notion instead) ---------- **/
+// Calendar integration has been replaced with Notion integration
+// Old calendar function kept here for reference only
+/*
 function createOrReplaceEvent_(localMidnight, nWords, pdfPreviewLink) {
   const cal = (CALENDAR_ID === 'primary')
     ? CalendarApp.getDefaultCalendar()
@@ -322,7 +329,6 @@ function createOrReplaceEvent_(localMidnight, nWords, pdfPreviewLink) {
   const dateStr = toISODate_(localMidnight, TIMEZONE);
   const prefix  = 'Kindle SRS Review — ' + dateStr;
 
-  // Remove any existing SRS events for that day (one canonical per day)
   const existing = cal.getEvents(dayStart, dayEnd, { search: prefix });
   existing.forEach(e => { try { e.deleteEvent(); } catch (err) {} });
 
@@ -341,6 +347,7 @@ function createOrReplaceEvent_(localMidnight, nWords, pdfPreviewLink) {
   if (ADD_CAL_EMAIL_REMINDER) { try { ev.addEmailReminder(0); } catch (e) {} }
   return ev.getId();
 }
+*/
 
 /** ---------- NO-GAPS (seed/borrow/restart for today; seed-only for future) ---------- **/
 function _ensureMinForDay_(state, localMidnight, minCount, opts) {
@@ -620,6 +627,68 @@ function _ttsSynthesize_(text, filenameBase, audioFolder) {
     file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
     return file.getUrl();
   } catch (e) { return ''; }
+}
+
+/** ---------- NOTION INTEGRATION ---------- **/
+function _sendToNotion_(wordKeys, state, dateISO, pdfLink) {
+  if (!NOTION_API_KEY || NOTION_API_KEY === 'YOUR_NOTION_API_KEY') {
+    Logger.log('⚠️  Notion API key not configured. Skipping Notion sync.');
+    return;
+  }
+
+  try {
+    // Create a page for each word in the Notion database
+    wordKeys.forEach(key => {
+      const word = state.words[key];
+      if (!word) return;
+
+      const notionPayload = {
+        parent: { database_id: NOTION_DATABASE_ID },
+        properties: {
+          'Word': {
+            title: [{ text: { content: word.word || 'Unknown' } }]
+          },
+          'Definition': {
+            rich_text: [{ text: { content: word.definition || 'No definition' } }]
+          },
+          'Context': {
+            rich_text: [{ text: { content: word.context || '' } }]
+          },
+          'Source': {
+            rich_text: [{ text: { content: word.source || '' } }]
+          },
+          'Review Date': {
+            date: { start: dateISO }
+          },
+          'PDF Link': {
+            url: pdfLink || ''
+          }
+        }
+      };
+
+      const options = {
+        method: 'post',
+        contentType: 'application/json',
+        headers: {
+          'Authorization': 'Bearer ' + NOTION_API_KEY,
+          'Notion-Version': '2022-06-28'
+        },
+        payload: JSON.stringify(notionPayload),
+        muteHttpExceptions: true
+      };
+
+      const response = UrlFetchApp.fetch('https://api.notion.com/v1/pages', options);
+      const responseCode = response.getResponseCode();
+
+      if (responseCode === 200) {
+        Logger.log(`✅ Sent "${word.word}" to Notion`);
+      } else {
+        Logger.log(`❌ Failed to send "${word.word}" to Notion: ${response.getContentText()}`);
+      }
+    });
+  } catch (e) {
+    Logger.log(`❌ Notion integration error: ${e.message}`);
+  }
 }
 
 /** ---------- CSV / UTIL / STATE ---------- **/
